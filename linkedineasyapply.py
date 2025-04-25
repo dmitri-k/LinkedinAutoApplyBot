@@ -58,6 +58,7 @@ class AIResponseGenerator:
         - Skills: {', '.join(self.experience.keys())}
         - Languages: {', '.join(f'{lang}: {level}' for lang, level in self.languages.items())}
         - Professional Summary: {self.personal_info.get('MessageToManager', '')}
+        - Citizenship: {self.personal_info.get('citizenship', 'Not Specified')}
 
         Resume Content (Give the greatest weight to this information, if specified):
         {self.resume_content}
@@ -96,7 +97,7 @@ class AIResponseGenerator:
                 user_content += f"\n\nSelect the most appropriate answer by providing its index number from these options:\n{options_text}"
 
             response = self._client.chat.completions.create(
-                model="gpt-4o-2024-08-06",
+                model="gpt-4.1-2025-04-14",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
@@ -195,7 +196,7 @@ class LinkedinEasyApply:
     def __init__(self, parameters, driver):
         self.browser = driver
         self.email = parameters['email']
-        self.email = parameters['lastName']
+        # self.email = parameters['lastName']
         self.password = parameters['password']
         self.openai_api_key = parameters.get('openaiApiKey', '')  # Get API key with empty default
         self.disable_lock = parameters['disableAntiLock']
@@ -227,6 +228,8 @@ class LinkedinEasyApply:
         self.experience_default = int(self.experience['default'])
         self.debug = parameters.get('debug', False)
         self.evaluate_job_fit = parameters.get('evaluateJobFit', True)
+        self.test_single_url = parameters.get('testSingleUrl', None)
+        self.hiring_team_file_name = "hiring_team_contacts"
         self.ai_response_generator = AIResponseGenerator(
             api_key=self.openai_api_key,
             personal_info=self.personal_info,
@@ -286,6 +289,17 @@ class LinkedinEasyApply:
         time.sleep(random.uniform(5, 10))
 
     def start_applying(self):
+        # --- Modification for single URL testing ---
+        if self.test_single_url:
+            print(f"--- Running in Single URL Test Mode for: {self.test_single_url} ---")
+            self.browser.get(self.test_single_url)
+            time.sleep(random.uniform(3, 6)) # Allow page to load
+            success = self.apply_single_job(self.test_single_url)
+            status = "successfully" if success else "unsuccessfully"
+            print(f"--- Single URL Test Mode finished {status}. Exiting. ---")
+            return # Stop execution after testing the single URL
+        # --- End Modification ---
+
         searches = list(product(self.positions, self.locations))
         random.shuffle(searches)
 
@@ -382,19 +396,58 @@ class LinkedinEasyApply:
                 # Extract job details
                 job_title, company, poster, job_location, apply_method, link = "", "", "", "", "", ""
                 try:
-                    job_title_element = job_tile.find_element(By.CLASS_NAME, 'job-card-list__title--link')
-                    job_title = job_title_element.find_element(By.TAG_NAME, 'strong').text
-                    link = job_tile.find_element(By.CLASS_NAME, 'job-card-list__title--link').get_attribute('href').split('?')[0]
-                except:
-                    pass
+                    # Find the container for the job card data first for stability
+                    job_card_base = job_tile.find_element(By.CSS_SELECTOR, '.job-card-container, .job-card-list') # Try common container classes
+                    
+                    try:
+                        job_title_element = job_card_base.find_element(By.CSS_SELECTOR, '.job-card-list__title, .job-card-container__title') # Try common title classes
+                        job_title = job_title_element.text.strip()
+                        link = job_title_element.get_attribute('href').split('?')[0]
+                        if not job_title:
+                             print(f"Warning: Extracted empty job title string for card. Link: {link}")
+                    except NoSuchElementException:
+                         print("Warning: Could not extract job title/link using standard selectors.")
+                         # Fallback: Try finding any link within the job tile
+                         try:
+                             link_element = job_tile.find_element(By.TAG_NAME, 'a')
+                             link = link_element.get_attribute('href').split('?')[0]
+                             job_title = link_element.text.strip() # Maybe title is in the link text
+                             print(f"Recovered link: {link}, Title: {job_title}")
+                             if not job_title:
+                                 job_title = "UNKNOWN_TITLE (Recovered Link Only)"
+                         except Exception as fallback_e:
+                            print(f"Could not recover link/title using fallback: {fallback_e}")
+                            link = "UNKNOWN_LINK"
+                            job_title = "UNKNOWN_TITLE"
+                    except Exception as title_link_e:
+                        print(f"Warning: Unexpected error extracting job title/link: {title_link_e}")
+                        link = link or "UNKNOWN_LINK"
+                        job_title = job_title or "UNKNOWN_TITLE"
+
+                except NoSuchElementException:
+                    print("Warning: Could not find base job card container. Skipping detail extraction.")
+                    # Assign defaults if base container not found
+                    link = "UNKNOWN_LINK"
+                    job_title = "UNKNOWN_TITLE"
+                    company = "UNKNOWN_COMPANY"
 
                 try:
-                    company = job_tile.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text
-                except:
-                    pass
+                    # Use a more general selector that might catch different company name structures
+                    company_element = job_tile.find_element(By.CSS_SELECTOR, '[class*="job-card-container__primary-description"], [class*="job-card-container__company-name"], .artdeco-entity-lockup__subtitle')
+                    company = company_element.text.strip()
+                    if not company:
+                        print("Warning: Extracted empty company name string.")
+                        company = "UNKNOWN_COMPANY (Empty String)"
+                except NoSuchElementException:
+                     print("Warning: Could not extract company name using combined selector.")
+                     company = "UNKNOWN_COMPANY"
+                except Exception as company_e:
+                    print(f"Warning: Unexpected error extracting company name: {company_e}")
+                    company = "UNKNOWN_COMPANY"
 
+                # (Keep existing poster, location, apply_method extraction for now)
                 try:
-                    hiring_line = job_tile.find_element(By.XPATH, '//span[contains(.,\' is hiring for this\')]')
+                    hiring_line = job_tile.find_element(By.XPATH, '//span[contains(.,\" is hiring for this\")]')
                     hiring_line_text = hiring_line.text
                     name_terminating_index = hiring_line_text.find(' is hiring for this')
                     if name_terminating_index != -1:
@@ -441,7 +494,34 @@ class LinkedinEasyApply:
                             processed_jobs += 1
                             continue
 
-                        time.sleep(random.uniform(3, 5))
+                        time.sleep(random.uniform(3, 5)) # Wait for details pane to load
+
+                        # --- Extract Canonical Job URL from Details Pane ---
+                        canonical_job_url = link # Default to card link as fallback
+                        try:
+                            # Wait for the job title link in the details pane to be present
+                            job_details_title_selector = (By.CSS_SELECTOR, ".job-details-jobs-unified-top-card__job-title h1 a")
+                            WebDriverWait(self.browser, 10).until(
+                                EC.presence_of_element_located(job_details_title_selector)
+                            )
+                            title_link_element = self.browser.find_element(*job_details_title_selector)
+                            extracted_href = title_link_element.get_attribute('href')
+                            if extracted_href:
+                                # Construct absolute URL if href is relative
+                                if extracted_href.startswith('/'):
+                                     canonical_job_url = "https://www.linkedin.com" + extracted_href.split('?')[0]
+                                else:
+                                     canonical_job_url = extracted_href.split('?')[0]
+                                print(f"DEBUG: Found canonical job URL: {canonical_job_url}")
+                            else:
+                                 print("Warning: Found title link element but href was empty. Falling back to card link.")
+                        except TimeoutException:
+                            print("Warning: Timed out waiting for job title link in details pane. Falling back to card link.")
+                        except NoSuchElementException:
+                            print("Warning: Could not find job title link in details pane using selector. Falling back to card link.")
+                        except Exception as e_canon_url:
+                            print(f"Warning: Error extracting canonical job URL: {e_canon_url}. Falling back to card link.")
+                        # --- End Canonical URL Extraction ---
 
                         if self.evaluate_job_fit:
                             try:
@@ -457,24 +537,63 @@ class LinkedinEasyApply:
                             done_applying = self.apply_to_job()
                             if done_applying:
                                 print(f"Application sent to {company} for the position of {job_title}.")
+                                # Get the current URL after successful application
+                                try:
+                                    current_job_url = self.browser.current_url.split('?')[0]
+                                except Exception as e_url:
+                                    print(f"Warning: Could not get current job URL: {e_url}")
+                                    current_job_url = canonical_job_url # Fallback to the canonical URL if needed
+
+                                # Check for hiring team after successful application
+                                try:
+                                    # Use normalize-space() for robust text matching
+                                    hiring_team_header = self.browser.find_elements(By.XPATH, "//h2[normalize-space()='Meet the hiring team']")
+                                    if hiring_team_header:
+                                        print("Found 'Meet the hiring team' section.")
+                                        recruiter_link_element = self.browser.find_element(By.CSS_SELECTOR, ".hirer-card__hirer-information a")
+                                        recruiter_profile_url = recruiter_link_element.get_attribute('href')
+                                        if recruiter_profile_url:
+                                            # Use the canonical job URL extracted from the details pane
+                                            print(f"DEBUG: Writing hiring team contact with: Company='{company}', Title='{job_title}', JobLink='{canonical_job_url}', Recruiter='{recruiter_profile_url}'")
+                                            if not company or not job_title or not canonical_job_url or "UNKNOWN" in canonical_job_url or "UNKNOWN" in job_title or "UNKNOWN" in company:
+                                                 print(f"Warning: Missing or unknown data (Company: {company}, Title: {job_title}, Link: {canonical_job_url}). Skipping hiring team write.")
+                                            else:
+                                                 self.write_hiring_team_contact(company, job_title, canonical_job_url, recruiter_profile_url)
+                                except NoSuchElementException:
+                                    print("Could not find recruiter link within 'Meet the hiring team' section.")
+                                except Exception as ht_e:
+                                    print(f"Error processing 'Meet the hiring team' section: {ht_e}")
                             else:
-                                print(f"An application for a job at {company} has been submitted earlier.")
-                        except:
+                                print(f"Could not apply or Easy Apply button not found for {company}.") # Updated else message
+                        except Exception as apply_exc:
                             temp = self.file_name
                             self.file_name = "failed"
-                            print("Failed to apply to job. Please submit a bug report with this link: " + link)
+                            # Use the extracted link here for bug report
+                            print(f"Failed during apply_to_job for {job_title} at {company}: {apply_exc}. Link: {canonical_job_url}")
+                            traceback.print_exc() # Print stacktrace for apply_exc
                             try:
-                                self.write_to_file(company, job_title, link, job_location, location)
-                            except:
-                                pass
+                                # Ensure company/title/link are usable before writing failure
+                                company_to_write = company if company and "UNKNOWN" not in company else "UNKNOWN_COMPANY"
+                                title_to_write = job_title if job_title and "UNKNOWN" not in job_title else "UNKNOWN_TITLE"
+                                # Use canonical_job_url for logging failures too
+                                link_to_write = canonical_job_url if canonical_job_url and "UNKNOWN" not in canonical_job_url else "UNKNOWN_LINK"
+                                self.write_to_file(company_to_write, title_to_write, link_to_write, job_location, location)
+                            except Exception as write_fail_e:
+                                print(f"Additionally failed to write failure log: {write_fail_e}")
                             self.file_name = temp
-                            print(f'updated {temp}.')
+                            # print(f'Updated {temp}.csv.') # Already printed inside write_to_file usually
 
+                        # Log success to output.csv
                         try:
-                            self.write_to_file(company, job_title, link, job_location, location)
-                        except Exception:
-                            print(f"Unable to save the job information in the file. The job title {job_title} or company {company} cannot contain special characters,")
-                            traceback.print_exc()
+                             # Ensure company/title/link are usable before writing success
+                             company_to_write = company if company and "UNKNOWN" not in company else "UNKNOWN_COMPANY"
+                             title_to_write = job_title if job_title and "UNKNOWN" not in job_title else "UNKNOWN_TITLE"
+                             # Use canonical_job_url for logging success too
+                             link_to_write = canonical_job_url if canonical_job_url and "UNKNOWN" not in canonical_job_url else "UNKNOWN_LINK"
+                             self.write_to_file(company_to_write, title_to_write, link_to_write, job_location, location)
+                        except Exception as write_e:
+                            print(f"Unable to save the job information to {self.file_name}.csv for {title_to_write} at {company_to_write}. Link: {link_to_write}. Error: {write_e}")
+                            # traceback.print_exc() # Optional: De-clutter logs unless needed
 
                         processed_jobs += 1
 
@@ -516,9 +635,41 @@ class LinkedinEasyApply:
         easy_apply_button = None
 
         try:
-            easy_apply_button = self.browser.find_element(By.CLASS_NAME, 'jobs-apply-button')
-        except:
-            return False
+            # More specific selector for the main content button, adding wait
+            easy_apply_button_selector = (By.CSS_SELECTOR, '.jobs-apply-button--top-card .jobs-apply-button')
+            WebDriverWait(self.browser, 10).until(
+                EC.element_to_be_clickable(easy_apply_button_selector)
+            )
+            easy_apply_button = self.browser.find_element(*easy_apply_button_selector)
+        except TimeoutException:
+            print("Timeout waiting for Easy Apply button or it's not clickable.")
+            # Attempt to find the sticky header button as a fallback
+            try:
+                easy_apply_button_selector = (By.CSS_SELECTOR, '.scaffold-layout-toolbar .jobs-apply-button')
+                WebDriverWait(self.browser, 5).until(
+                    EC.element_to_be_clickable(easy_apply_button_selector)
+                )
+                easy_apply_button = self.browser.find_element(*easy_apply_button_selector)
+                print("Using fallback Easy Apply button from sticky header.")
+            except:
+                print("Could not find any clickable Easy Apply button.")
+                return False
+        except NoSuchElementException:
+            print("Easy Apply button not found with primary selector.")
+             # Attempt to find the sticky header button as a fallback
+            try:
+                easy_apply_button_selector = (By.CSS_SELECTOR, '.scaffold-layout-toolbar .jobs-apply-button')
+                WebDriverWait(self.browser, 5).until(
+                    EC.element_to_be_clickable(easy_apply_button_selector)
+                )
+                easy_apply_button = self.browser.find_element(*easy_apply_button_selector)
+                print("Using fallback Easy Apply button from sticky header.")
+            except:
+                print("Could not find any clickable Easy Apply button.")
+                return False
+        except Exception as e:
+             print(f"An unexpected error occurred finding the Easy Apply button: {e}")
+             return False
 
         try:
             job_description_area = self.browser.find_element(By.ID, "job-details")
@@ -764,8 +915,6 @@ class LinkedinEasyApply:
             return 'no'
         elif 'previously employ' in radio_text or 'previous employ' in radio_text:
             return 'no'
-        elif 'authorized' in radio_text or 'authorised' in radio_text or 'legally' in radio_text:
-            return self.get_answer('legallyAuthorized')
         elif any(keyword in radio_text.lower() for keyword in [
             'certified', 'certificate', 'cpa', 'chartered accountant', 'qualification'
         ]):
@@ -780,22 +929,12 @@ class LinkedinEasyApply:
             return self.get_answer('backgroundCheck')
         elif 'drug test' in radio_text:
             return self.get_answer('drugTest')
-        elif 'currently living' in radio_text or 'currently reside' in radio_text or 'right to live' in radio_text:
-            return self.get_answer('residency')
         elif 'level of education' in radio_text:
             for degree in self.checkboxes['degreeCompleted']:
                 if degree.lower() in radio_text:
                     return "yes"
-        elif 'experience' in radio_text:
-            if self.experience_default > 0:
-                return 'yes'
-            for experience in self.experience:
-                if experience.lower() in radio_text:
-                    return "yes"
         elif 'data retention' in radio_text:
             return 'no'
-        elif 'sponsor' in radio_text:
-            return self.get_answer('requireVisa')
         return None
 
     def _handle_text_question(self, question):
@@ -825,6 +964,7 @@ class LinkedinEasyApply:
                     print(f"Debug: No predefined answer for text question: {question_text}")
                 self.record_unprepared_question(text_field_type, question_text)
                 response_type = "numeric" if text_field_type == 'numeric' else "text"
+                print(f"Requesting AI {response_type} response for: {question_text}")
                 to_enter = self.ai_response_generator.generate_response(
                     question_text, response_type=response_type
                 )
@@ -840,12 +980,7 @@ class LinkedinEasyApply:
 
     def _get_text_answer(self, question_text, text_field_type):
         """Determine the answer for a text or numeric question."""
-        if 'experience' in question_text or 'how many years in' in question_text or 'how many years' in question_text and text_field_type == 'numeric':
-            for experience in self.experience:
-                if experience.lower() in question_text:
-                    return int(self.experience[experience])
-            return None
-        elif 'grade point average' in question_text:
+        if 'grade point average' in question_text:
             return self.university_gpa
         elif 'first name' in question_text and 'last name' not in question_text:
             return self.personal_info['First Name']
@@ -936,21 +1071,11 @@ class LinkedinEasyApply:
             for option in options:
                 if 'no' in option.lower():
                     return option
-        elif 'sponsor' in question_text:
-            answer = self.get_answer('requireVisa')
-            for option in options:
-                if answer.lower() in option.lower():
-                    return option
         elif 'above 18' in question_text:
             for option in options:
                 if 'yes' in option.lower():
                     return option
             return options[0]
-        elif 'currently living' in question_text or 'currently reside' in question_text or 'authorized' in question_text or 'authorised' in question_text or 'citizenship' in question_text:
-            answer = self.get_answer('residency' if 'reside' in question_text else 'legallyAuthorized')
-            for option in options:
-                if answer.lower() in option.lower() or ('no' in option.lower() and 'citizenship' in question_text and answer == 'yes'):
-                    return option
         elif any(keyword in question_text.lower() for keyword in [
             'aboriginal', 'native', 'indigenous', 'tribe', 'first nations',
             'native american', 'native hawaiian', 'inuit', 'metis', 'maori',
@@ -960,18 +1085,6 @@ class LinkedinEasyApply:
             negative_keywords = ['prefer', 'decline', 'don\'t', 'specified', 'none']
             for option in options:
                 if any(neg_keyword in option.lower() for neg_keyword in negative_keywords):
-                    return option
-        elif 'experience' in question_text or 'understanding' in question_text or 'familiar' in question_text or 'comfortable' in question_text or 'able to' in question_text:
-            answer = 'no'
-            if self.experience_default > 0:
-                answer = 'yes'
-            else:
-                for experience in self.experience:
-                    if experience.lower() in question_text and self.experience[experience] > 0:
-                        answer = 'yes'
-                        break
-            for option in options:
-                if answer.lower() in option.lower():
                     return option
         return None
 
@@ -1115,6 +1228,27 @@ class LinkedinEasyApply:
                 "Special characters in questions are not allowed. Failed to update unprepared questions log.")
             print(question_text)
 
+    def write_hiring_team_contact(self, company, job_title, job_link, recruiter_profile_link):
+        """Writes recruiter contact info found on job page."""
+        to_write = [company, job_title, job_link, recruiter_profile_link, datetime.now()]
+        file_path = self.hiring_team_file_name + ".csv"
+        print(f'Saving hiring team contact to {file_path}.')
+
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
+
+        # Check if file exists to write header
+        file_exists = os.path.isfile(file_path)
+
+        try:
+            with open(file_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['Company', 'Job Title', 'Job Link', 'Recruiter Profile Link', 'Timestamp']) # Write header if new file
+                writer.writerow(to_write)
+        except Exception as e:
+            print(f"Failed to write hiring team contact to {file_path}: {e}")
+
     def scroll_slow(self, scrollable_element, start=0, end=3600, step=100, reverse=False):
         if reverse:
             start, end = end, start
@@ -1185,7 +1319,119 @@ class LinkedinEasyApply:
         return extra_search_terms_str
 
     def next_job_page(self, position, location, job_page):
+        # Restore original dynamic URL construction
         self.browser.get("https://www.linkedin.com/jobs/search/" + self.base_search_url +
                          "&keywords=" + position + location + "&start=" + str(job_page * 25))
 
+        # Remove hardcoded URL logic
+        # hardcoded_url = "https://www.linkedin.com/jobs/view/4201303600/?alternateChannel=search&refId=NotAvailable&trackingId=hope%2BbQ1RxG0tPtF4xby9A%3D%3D&trk=d_flagship3_search_srp_jobs"
+        # print(f"Navigating to hardcoded URL for testing: {hardcoded_url}")
+        # self.browser.get(hardcoded_url)
+
+        # --- Modification for hardcoded URL ---
+        # Instead of apply_jobs, call apply_single_job for the hardcoded URL
+        # self.apply_single_job(hardcoded_url)
+
+        # After processing the single job, raise an exception to stop the start_applying loop
+        # This prevents it from trying to process the same job repeatedly
+        # raise StopIteration("Processed single hardcoded job. Stopping execution as requested for testing.")
+        # --- End Modification ---
+
+        # Restore original logic
         self.avoid_lock()
+        # --- End Restore ---
+
+    def apply_single_job(self, job_url):
+        """Handles applying to a single job when navigated directly to its page."""
+        print(f"Attempting to apply to single job at: {job_url}")
+        job_title, company, job_location = "", "", ""
+        try:
+            # Extract job details from the single job view page
+            try:
+                # Wait for the main content area to load
+                WebDriverWait(self.browser, 15).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, 'job-details-jobs-unified-top-card__job-title'))
+                )
+                job_title_element = self.browser.find_element(By.CLASS_NAME, 'job-details-jobs-unified-top-card__job-title')
+                job_title = job_title_element.find_element(By.TAG_NAME, 'h1').text.strip()
+                print(f"Extracted Job Title: {job_title}")
+            except Exception as e:
+                print(f"Warning: Could not extract job title - {e}")
+                job_title = "Unknown Title"
+
+            try:
+                company_element = self.browser.find_element(By.CSS_SELECTOR, '.job-details-jobs-unified-top-card__company-name a')
+                company = company_element.text.strip()
+                print(f"Extracted Company: {company}")
+            except Exception as e:
+                print(f"Warning: Could not extract company name - {e}")
+                company = "Unknown Company"
+
+            try:
+                # Location is often within a span in the tertiary description
+                location_element = self.browser.find_element(By.CSS_SELECTOR, '.job-details-jobs-unified-top-card__primary-description-container span.tvm__text.tvm__text--low-emphasis')
+                job_location = location_element.text.strip()
+                print(f"Extracted Location: {job_location}")
+            except Exception as e:
+                print(f"Warning: Could not extract job location - {e}")
+                job_location = "Unknown Location"
+
+
+            # --- Optional: AI Job Fit Evaluation ---
+            if self.evaluate_job_fit:
+                try:
+                    # Ensure job details element exists before accessing text
+                    WebDriverWait(self.browser, 10).until(
+                        EC.presence_of_element_located((By.ID, 'job-details'))
+                    )
+                    job_description = self.browser.find_element(By.ID, 'job-details').text
+                    if not self.ai_response_generator.evaluate_job_fit(job_title, job_description):
+                        print("Skipping application: Job requirements not aligned with candidate profile per AI evaluation.")
+                        # Record the skip? Or just return? For now, just return.
+                        self.write_to_file(company, job_title, job_url, job_location, "SingleJobSkip")
+                        return False # Indicate skipped
+                except Exception as e:
+                    print(f"Could not perform AI job fit evaluation: {e}")
+                    # Decide whether to proceed or not if evaluation fails. Proceeding for now.
+
+            # --- Apply to Job ---
+            try:
+                done_applying = self.apply_to_job()
+                if done_applying:
+                    print(f"Application submitted to {company} for the position of {job_title}.")
+                else:
+                    # apply_to_job returns False if Easy Apply button isn't found
+                    print(f"Could not find Easy Apply button for {job_title} at {company}.")
+                    # Log as failed or skipped? Let's log as failed for now.
+                    self.file_name = "failed"
+                    self.write_to_file(company, job_title, job_url, job_location, "SingleJobFail")
+                    self.file_name = "output" # Reset filename
+                    return False
+
+            except Exception as e:
+                self.file_name = "failed"
+                print(f"Failed during the application process for {job_title} at {company}: {e}")
+                traceback.print_exc()
+                self.write_to_file(company, job_title, job_url, job_location, "SingleJobFail")
+                self.file_name = "output" # Reset filename
+                return False # Indicate failure
+
+            # --- Log Success ---
+            try:
+                self.write_to_file(company, job_title, job_url, job_location, "SingleJobSuccess")
+            except Exception as e:
+                print(f"Unable to save the job information in the file: {e}")
+
+            # Prevent further processing in start_applying loop for this test case
+            # raise Exception("Single hardcoded job processed. Stopping.") # Remove this - control flow is handled in start_applying now
+
+            return True # Indicate success
+
+        except Exception as e:
+            print(f"An error occurred in apply_single_job: {e}")
+            traceback.print_exc()
+            # Log failure if details couldn't even be extracted
+            self.file_name = "failed"
+            self.write_to_file("Unknown", "Unknown", job_url, "Unknown", "SingleJobError")
+            self.file_name = "output"
+            return False # Indicate failure
